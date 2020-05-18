@@ -39,6 +39,7 @@
 #include <unistd.h>
 
 #include "absl/memory/memory.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/string_view.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/substitute.h"
@@ -67,6 +68,10 @@ static void Throw(const char *str, int line) {
 
 #define THROW(msg) Throw(msg, __LINE__)
 #define THROWF(...) Throw(absl::Substitute(__VA_ARGS__).c_str(), __LINE__)
+#define WARN(...)                                                   \
+  if (verbose_level > 0) {                                          \
+    printf("WARNING: %s\n", absl::Substitute(__VA_ARGS__).c_str()); \
+  }
 
 namespace bloaty {
 
@@ -93,6 +98,7 @@ constexpr DataSourceDefinition data_sources[] = {
      "raw ranges of previous data source."},
     {DataSource::kSections, "sections", "object file section"},
     {DataSource::kSegments, "segments", "load commands in the binary"},
+    // We require that all symbols sources are >= kSymbols.
     {DataSource::kSymbols, "symbols",
      "symbols from symbol table (configure demangling with --demangle)"},
     {DataSource::kRawSymbols, "rawsymbols", "unmangled symbols"},
@@ -142,7 +148,7 @@ void CheckedAdd(A* accum, B val) {
 #endif
 }
 
-std::string CSVEscape(string_view str) {
+static std::string CSVEscape(string_view str) {
   bool need_escape = false;
 
   for (char ch : str) {
@@ -319,7 +325,7 @@ class Rollup {
   Rollup(Rollup&& other) = default;
   Rollup& operator=(Rollup&& other) = default;
 
-  void AddSizes(const std::vector<std::string> names,
+  void AddSizes(const std::vector<std::string>& names,
                 uint64_t size, bool is_vmsize) {
     // We start at 1 to exclude the base map (see base_map_).
     AddInternal(names, 1, size, is_vmsize);
@@ -336,10 +342,16 @@ class Rollup {
     RollupRow* row = &output->toplevel_row_;
     row->vmsize = vm_total_;
     row->filesize = file_total_;
+    row->filtered_vmsize = filtered_vm_total_;
+    row->filtered_filesize = filtered_file_total_;
     row->vmpercent = 100;
     row->filepercent = 100;
     output->diff_mode_ = true;
     CreateRows(row, base, options, true);
+  }
+
+  void SetFilterRegex(const RE2* regex) {
+    filter_regex_ = regex;
   }
 
   // Subtract the values in "other" from this.
@@ -371,12 +383,17 @@ class Rollup {
   }
 
   int64_t file_total() const { return file_total_; }
+  int64_t filtered_file_total() const { return filtered_file_total_; }
 
  private:
   BLOATY_DISALLOW_COPY_AND_ASSIGN(Rollup);
 
   int64_t vm_total_ = 0;
   int64_t file_total_ = 0;
+  int64_t filtered_vm_total_ = 0;
+  int64_t filtered_file_total_ = 0;
+
+  const RE2* filter_regex_ = nullptr;
 
   // Putting Rollup by value seems to work on some compilers/libs but not
   // others.
@@ -393,13 +410,38 @@ class Rollup {
 
   // Adds "size" bytes to the rollup under the label names[i].
   // If there are more entries names[i+1, i+2, etc] add them to sub-rollups.
-  void AddInternal(const std::vector<std::string> names, size_t i,
+  void AddInternal(const std::vector<std::string>& names, size_t i,
                    uint64_t size, bool is_vmsize) {
+    if (filter_regex_ != nullptr) {
+      // filter_regex_ is only set in the root rollup, which checks the full
+      // label hierarchy for a match to determine whether a region should be
+      // considered.
+      bool any_matched = false;
+
+      for (const auto& name : names) {
+        if (RE2::PartialMatch(name, *filter_regex_)) {
+          any_matched = true;
+          break;
+        }
+      }
+
+      if (!any_matched) {
+        // Ignore this region in the rollup and don't visit sub-rollups.
+        if (is_vmsize) {
+          CheckedAdd(&filtered_vm_total_, size);
+        } else {
+          CheckedAdd(&filtered_file_total_, size);
+        }
+        return;
+      }
+    }
+
     if (is_vmsize) {
       CheckedAdd(&vm_total_, size);
     } else {
       CheckedAdd(&file_total_, size);
     }
+
     if (i < names.size()) {
       auto& child = children_[names[i]];
       if (child.get() == nullptr) {
@@ -409,7 +451,7 @@ class Rollup {
     }
   }
 
-  static double Percent(ssize_t part, size_t whole) {
+  static double Percent(int64_t part, int64_t whole) {
     if (whole == 0) {
       if (part == 0) {
         return NAN;
@@ -595,11 +637,7 @@ void Rollup::SortAndAggregateRows(RollupRow* row, const Rollup* base,
 // data is in this format, we can print it to the screen (or verify the output
 // in unit tests).
 
-void PrintSpaces(size_t n, std::ostream* out) {
-  for (size_t i = 0; i < n; i++) {
-    *out << " ";
-  }
-}
+namespace {
 
 std::string FixedWidthString(const std::string& input, size_t size) {
   if (input.size() < size) {
@@ -611,6 +649,14 @@ std::string FixedWidthString(const std::string& input, size_t size) {
   } else {
     return input.substr(0, size);
   }
+}
+
+bool ShowFile(const OutputOptions& options) {
+  return options.show != ShowDomain::kShowVM;
+}
+
+bool ShowVM(const OutputOptions& options) {
+  return options.show != ShowDomain::kShowFile;
 }
 
 std::string LeftPad(const std::string& input, size_t size) {
@@ -628,7 +674,7 @@ std::string DoubleStringPrintf(const char *fmt, double d) {
   return std::string(buf);
 }
 
-std::string SiPrint(ssize_t size, bool force_sign) {
+std::string SiPrint(int64_t size, bool force_sign) {
   const char *prefixes[] = {"", "Ki", "Mi", "Gi", "Ti"};
   size_t num_prefixes = 5;
   size_t n = 0;
@@ -641,7 +687,7 @@ std::string SiPrint(ssize_t size, bool force_sign) {
   std::string ret;
 
   if (fabs(size_d) > 100 || n == 0) {
-    ret = std::to_string(static_cast<ssize_t>(size_d)) + prefixes[n];
+    ret = std::to_string(static_cast<int64_t>(size_d)) + prefixes[n];
     if (force_sign && size > 0) {
       ret = "+" + ret;
     }
@@ -690,70 +736,127 @@ std::string PercentString(double percent, bool diff_mode) {
   }
 }
 
+}  // namespace
+
 void RollupOutput::PrettyPrintRow(const RollupRow& row, size_t indent,
-                                  size_t longest_label,
+                                  const OutputOptions& options,
                                   std::ostream* out) const {
-  *out << FixedWidthString("", indent) << " "
-       << PercentString(row.vmpercent, diff_mode_) << " "
-       << SiPrint(row.vmsize, diff_mode_) << " "
-       << FixedWidthString(row.name, longest_label) << " "
-       << SiPrint(row.filesize, diff_mode_) << " "
-       << PercentString(row.filepercent, diff_mode_) << "\n";
+  if (&row != &toplevel_row_) {
+    // Avoid printing this row if it is only zero.
+    // This can happen when using --domain if the row is zero for this domain.
+    if ((!ShowFile(options) && row.vmsize == 0) ||
+        (!ShowVM(options) && row.filesize == 0)) {
+      return;
+    }
+  }
+
+  *out << FixedWidthString("", indent) << " ";
+
+  if (ShowFile(options)) {
+    *out << PercentString(row.filepercent, diff_mode_) << " "
+         << SiPrint(row.filesize, diff_mode_) << " ";
+  }
+
+  if (ShowVM(options)) {
+    *out << PercentString(row.vmpercent, diff_mode_) << " "
+         << SiPrint(row.vmsize, diff_mode_) << " ";
+  }
+
+  *out << "   " << row.name << "\n";
+}
+
+bool RollupOutput::IsSame(const std::string& a, const std::string& b) {
+  if (a == b) {
+    return true;
+  }
+
+  if (absl::EndsWith(b, a + "]") || absl::EndsWith(a, b + "]")) {
+    return true;
+  }
+
+  return false;
 }
 
 void RollupOutput::PrettyPrintTree(const RollupRow& row, size_t indent,
-                                   size_t longest_label,
+                                   const OutputOptions& options,
                                    std::ostream* out) const {
   // Rows are printed before their sub-rows.
-  PrettyPrintRow(row, indent, longest_label, out);
+  PrettyPrintRow(row, indent, options, out);
 
-  if (row.vmsize || row.filesize) {
-    for (const auto& child : row.sorted_children) {
-      PrettyPrintTree(child, indent + 4, longest_label, out);
-    }
+  if (!row.vmsize && !row.filesize) {
+    return;
   }
-}
 
-size_t RollupOutput::CalculateLongestLabel(const RollupRow& row,
-                                           int indent) const {
-  size_t ret = indent + row.name.size();
+  if (row.sorted_children.size() == 1 &&
+      row.sorted_children[0].sorted_children.size() == 0 &&
+      IsSame(row.name, row.sorted_children[0].name)) {
+    return;
+  }
 
   for (const auto& child : row.sorted_children) {
-    ret = std::max(ret, CalculateLongestLabel(child, indent + 4));
+    PrettyPrintTree(child, indent + 2, options, out);
   }
-
-  return ret;
 }
 
-void RollupOutput::PrettyPrint(size_t max_label_len, std::ostream* out) const {
-  size_t longest_label = toplevel_row_.name.size();
-  for (const auto& child : toplevel_row_.sorted_children) {
-    longest_label = std::max(longest_label, CalculateLongestLabel(child, 0));
+void RollupOutput::PrettyPrint(const OutputOptions& options,
+                               std::ostream* out) const {
+  if (ShowFile(options)) {
+    *out << "    FILE SIZE   ";
   }
 
-  longest_label = std::min(longest_label, max_label_len);
+  if (ShowVM(options)) {
+    *out << "     VM SIZE    ";
+  }
 
-  *out << "     VM SIZE    ";
-  PrintSpaces(longest_label, out);
-  *out << "    FILE SIZE";
   *out << "\n";
 
-  *out << " -------------- ";
-  PrintSpaces(longest_label, out);
-  *out << " --------------";
+  if (ShowFile(options)) {
+    *out << " -------------- ";
+  }
+
+  if (ShowVM(options)) {
+    *out << " -------------- ";
+  }
+
   *out << "\n";
 
   for (const auto& child : toplevel_row_.sorted_children) {
-    PrettyPrintTree(child, 0, longest_label, out);
+    PrettyPrintTree(child, 0, options, out);
   }
 
   // The "TOTAL" row comes after all other rows.
-  PrettyPrintRow(toplevel_row_, 0, longest_label, out);
+  PrettyPrintRow(toplevel_row_, 0, options, out);
+
+  uint64_t file_filtered = 0;
+  uint64_t vm_filtered = 0;
+  if (ShowFile(options)) {
+    file_filtered = toplevel_row_.filtered_filesize;
+  }
+  if (ShowVM(options)) {
+    vm_filtered = toplevel_row_.filtered_vmsize;
+  }
+
+  if (vm_filtered == 0 && file_filtered == 0) {
+    return;
+  }
+
+  *out << "Filtering enabled (source_filter); omitted";
+
+  if (file_filtered > 0 && vm_filtered > 0) {
+    *out << " file =" << SiPrint(file_filtered, /*force_sign=*/false)
+         << ", vm =" << SiPrint(vm_filtered, /*force_sign=*/false);
+  } else if (file_filtered > 0) {
+    *out << SiPrint(file_filtered, /*force_sign=*/false);
+  } else {
+    *out << SiPrint(vm_filtered, /*force_sign=*/false);
+  }
+
+   *out << " of entries\n";
 }
 
 void RollupOutput::PrintRowToCSV(const RollupRow& row,
                                  std::vector<std::string> parent_labels,
-                                 std::ostream* out) const {
+                                 std::ostream* out, bool tabs) const {
   while (parent_labels.size() < source_names_.size()) {
     // If this label had no data at this level, append an empty string.
     parent_labels.push_back("");
@@ -762,33 +865,42 @@ void RollupOutput::PrintRowToCSV(const RollupRow& row,
   parent_labels.push_back(std::to_string(row.vmsize));
   parent_labels.push_back(std::to_string(row.filesize));
 
-  *out << absl::StrJoin(parent_labels, ",") << "\n";
+  std::string sep = tabs ? "\t" : ",";
+  *out << absl::StrJoin(parent_labels, sep) << "\n";
 }
 
 void RollupOutput::PrintTreeToCSV(const RollupRow& row,
                                   std::vector<std::string> parent_labels,
-                                  std::ostream* out) const {
-  parent_labels.push_back(row.name);
+                                  std::ostream* out, bool tabs) const {
+  if (tabs) {
+    parent_labels.push_back(row.name);
+  } else {
+    parent_labels.push_back(CSVEscape(row.name));
+  }
+
   if (row.sorted_children.size() > 0) {
     for (const auto& child_row : row.sorted_children) {
-      PrintTreeToCSV(child_row, parent_labels, out);
+      PrintTreeToCSV(child_row, parent_labels, out, tabs);
     }
   } else {
-    PrintRowToCSV(row, parent_labels, out);
+    PrintRowToCSV(row, parent_labels, out, tabs);
   }
 }
 
-void RollupOutput::PrintToCSV(std::ostream* out) const {
+void RollupOutput::PrintToCSV(std::ostream* out, bool tabs) const {
   std::vector<std::string> names(source_names_);
   names.push_back("vmsize");
   names.push_back("filesize");
-  *out << absl::StrJoin(names, ",") << "\n";
+  std::string sep = tabs ? "\t" : ",";
+  *out << absl::StrJoin(names, sep) << "\n";
   for (const auto& child_row : toplevel_row_.sorted_children) {
-    PrintTreeToCSV(child_row, std::vector<std::string>(), out);
+    PrintTreeToCSV(child_row, std::vector<std::string>(), out, tabs);
   }
 }
 
 // RangeMap ////////////////////////////////////////////////////////////////////
+
+constexpr uint64_t RangeSink::kUnknownSize;
 
 
 // MmapInputFile ///////////////////////////////////////////////////////////////
@@ -857,13 +969,91 @@ std::unique_ptr<InputFile> MmapInputFileFactory::OpenFile(
 
 // RangeSink ///////////////////////////////////////////////////////////////////
 
-RangeSink::RangeSink(const InputFile* file, DataSource data_source,
-                     const DualMap* translator)
+RangeSink::RangeSink(const InputFile* file, const Options& options,
+                     DataSource data_source, const DualMap* translator)
     : file_(file),
+      options_(options),
       data_source_(data_source),
       translator_(translator) {}
 
 RangeSink::~RangeSink() {}
+
+uint64_t debug_vmaddr = -1;
+uint64_t debug_fileoff = -1;
+
+bool RangeSink::ContainsVerboseVMAddr(uint64_t vmaddr, uint64_t vmsize) {
+  return options_.verbose_level() > 2 ||
+         (options_.has_debug_vmaddr() && options_.debug_vmaddr() >= vmaddr &&
+          options_.debug_vmaddr() < (vmaddr + vmsize));
+}
+
+bool RangeSink::ContainsVerboseFileOffset(uint64_t fileoff, uint64_t filesize) {
+  return options_.verbose_level() > 2 ||
+         (options_.has_debug_fileoff() && options_.debug_fileoff() >= fileoff &&
+          options_.debug_fileoff() < (fileoff + filesize));
+}
+
+bool RangeSink::IsVerboseForVMRange(uint64_t vmaddr, uint64_t vmsize) {
+  if (vmsize == RangeMap::kUnknownSize) {
+    vmsize = UINT64_MAX - vmaddr;
+  }
+
+  if (vmaddr + vmsize < vmaddr) {
+    THROWF("Overflow in vm range, vmaddr=$0, vmsize=$1", vmaddr, vmsize);
+  }
+
+  if (ContainsVerboseVMAddr(vmaddr, vmsize)) {
+    return true;
+  }
+
+  if (translator_ && options_.has_debug_fileoff()) {
+    RangeMap vm_map;
+    RangeMap file_map;
+    bool contains = false;
+    vm_map.AddRangeWithTranslation(vmaddr, vmsize, "", translator_->vm_map,
+                                   false, &file_map);
+    file_map.ForEachRange(
+        [this, &contains](uint64_t fileoff, uint64_t filesize) {
+          if (ContainsVerboseFileOffset(fileoff, filesize)) {
+            contains = true;
+          }
+        });
+    return contains;
+  }
+
+  return false;
+}
+
+bool RangeSink::IsVerboseForFileRange(uint64_t fileoff, uint64_t filesize) {
+  if (filesize == RangeMap::kUnknownSize) {
+    filesize = UINT64_MAX - fileoff;
+  }
+
+  if (fileoff + filesize < fileoff) {
+    THROWF("Overflow in file range, fileoff=$0, filesize=$1", fileoff,
+           filesize);
+  }
+
+  if (ContainsVerboseFileOffset(fileoff, filesize)) {
+    return true;
+  }
+
+  if (translator_ && options_.has_debug_vmaddr()) {
+    RangeMap vm_map;
+    RangeMap file_map;
+    bool contains = false;
+    file_map.AddRangeWithTranslation(fileoff, filesize, "",
+                                     translator_->file_map, false, &vm_map);
+    vm_map.ForEachRange([this, &contains](uint64_t vmaddr, uint64_t vmsize) {
+      if (ContainsVerboseVMAddr(vmaddr, vmsize)) {
+        contains = true;
+      }
+    });
+    return contains;
+  }
+
+  return false;
+}
 
 void RangeSink::AddOutput(DualMap* map, const NameMunger* munger) {
   outputs_.push_back(std::make_pair(map, munger));
@@ -871,19 +1061,21 @@ void RangeSink::AddOutput(DualMap* map, const NameMunger* munger) {
 
 void RangeSink::AddFileRange(const char* analyzer, string_view name,
                              uint64_t fileoff, uint64_t filesize) {
-  if (verbose_level > 2) {
-    fprintf(stdout, "[%s, %s] AddFileRange(%.*s, %" PRIx64 ", %" PRIx64 ")\n",
-            GetDataSourceLabel(data_source_), analyzer, (int)name.size(),
-            name.data(), fileoff, filesize);
+  bool verbose = IsVerboseForFileRange(fileoff, filesize);
+  if (verbose) {
+    printf("[%s, %s] AddFileRange(%.*s, %" PRIx64 ", %" PRIx64 ")\n",
+           GetDataSourceLabel(data_source_), analyzer, (int)name.size(),
+           name.data(), fileoff, filesize);
   }
   for (auto& pair : outputs_) {
     const std::string label = pair.second->Munge(name);
     if (translator_) {
       bool ok = pair.first->file_map.AddRangeWithTranslation(
-          fileoff, filesize, label, translator_->file_map, &pair.first->vm_map);
+          fileoff, filesize, label, translator_->file_map, verbose,
+          &pair.first->vm_map);
       if (!ok) {
-        THROWF("File range ($0, $1) for label $2 extends beyond base map",
-               fileoff, filesize, name);
+        WARN("File range ($0, $1) for label $2 extends beyond base map",
+             fileoff, filesize, name);
       }
     } else {
       pair.first->file_map.AddRange(fileoff, filesize, label);
@@ -891,28 +1083,26 @@ void RangeSink::AddFileRange(const char* analyzer, string_view name,
   }
 }
 
-void RangeSink::AddFileRangeFor(const char* analyzer,
-                                uint64_t label_from_vmaddr,
-                                string_view file_range) {
+void RangeSink::AddFileRangeForVMAddr(const char* analyzer,
+                                      uint64_t label_from_vmaddr,
+                                      string_view file_range) {
   uint64_t file_offset = file_range.data() - file_->data().data();
-  if (verbose_level > 2) {
-    fprintf(stdout,
-            "[%s, %s] AddFileRangeFor(%" PRIx64 ", [%" PRIx64
-            ", %zx])\n",
-            GetDataSourceLabel(data_source_), analyzer, label_from_vmaddr,
-            file_offset, file_range.size());
+  bool verbose = IsVerboseForFileRange(file_offset, file_range.size());
+  if (verbose) {
+    printf("[%s, %s] AddFileRangeForVMAddr(%" PRIx64 ", [%" PRIx64 ", %zx])\n",
+           GetDataSourceLabel(data_source_), analyzer, label_from_vmaddr,
+           file_offset, file_range.size());
   }
   assert(translator_);
   for (auto& pair : outputs_) {
     std::string label;
-    uint64_t offset;
-    if (pair.first->vm_map.TryGetLabel(label_from_vmaddr, &label, &offset)) {
+    if (pair.first->vm_map.TryGetLabel(label_from_vmaddr, &label)) {
       bool ok = pair.first->file_map.AddRangeWithTranslation(
-          file_offset, file_range.size(), label, translator_->file_map,
+          file_offset, file_range.size(), label, translator_->file_map, verbose,
           &pair.first->vm_map);
       if (!ok) {
-        THROWF("File range ($0, $1) for label $2 extends beyond base map",
-               offset, file_range.size(), label);
+        WARN("File range ($0, $1) for label $2 extends beyond base map",
+             file_offset, file_range.size(), label);
       }
     } else if (verbose_level > 2) {
       printf("No label found for vmaddr %" PRIx64 "\n", label_from_vmaddr);
@@ -920,24 +1110,57 @@ void RangeSink::AddFileRangeFor(const char* analyzer,
   }
 }
 
-void RangeSink::AddVMRangeFor(const char* analyzer, uint64_t label_from_vmaddr,
-                              uint64_t addr, uint64_t size) {
-  if (verbose_level > 2) {
-    fprintf(stdout,
-            "[%s, %s] AddVMRangeFor(%" PRIx64 ", [%" PRIx64 ", %" PRIx64 "])\n",
-            GetDataSourceLabel(data_source_), analyzer, label_from_vmaddr, addr,
-            size);
+void RangeSink::AddFileRangeForFileRange(const char* analyzer,
+                                         absl::string_view from_file_range,
+                                         absl::string_view file_range) {
+  uint64_t file_offset = file_range.data() - file_->data().data();
+  uint64_t from_file_offset = from_file_range.data() - file_->data().data();
+  bool verbose = IsVerboseForFileRange(file_offset, file_range.size());
+  if (verbose) {
+    printf("[%s, %s] AddFileRangeForFileRange([%" PRIx64 ", %zx], [%" PRIx64
+           ", %zx])\n",
+           GetDataSourceLabel(data_source_), analyzer, from_file_offset,
+           from_file_range.size(), file_offset, file_range.size());
   }
   assert(translator_);
   for (auto& pair : outputs_) {
     std::string label;
-    uint64_t offset;
-    if (pair.first->vm_map.TryGetLabel(label_from_vmaddr, &label, &offset)) {
-      bool ok = pair.first->vm_map.AddRangeWithTranslation(
-          addr, size, label, translator_->vm_map, &pair.first->file_map);
+    if (pair.first->file_map.TryGetLabelForRange(
+            from_file_offset, from_file_range.size(), &label)) {
+      bool ok = pair.first->file_map.AddRangeWithTranslation(
+          file_offset, file_range.size(), label, translator_->file_map, verbose,
+          &pair.first->vm_map);
       if (!ok) {
-        THROWF("VM range ($0, $1) for label $2 extends beyond base map", addr,
-               size, label);
+        WARN("File range ($0, $1) for label $2 extends beyond base map",
+             file_offset, file_range.size(), label);
+      }
+    } else if (verbose_level > 2) {
+      printf("No label found for file range [%" PRIx64 ", %zx]\n",
+             from_file_offset, from_file_range.size());
+    }
+  }
+}
+
+void RangeSink::AddVMRangeForVMAddr(const char* analyzer,
+                                    uint64_t label_from_vmaddr, uint64_t addr,
+                                    uint64_t size) {
+  bool verbose = IsVerboseForVMRange(addr, size);
+  if (verbose) {
+    printf("[%s, %s] AddVMRangeForVMAddr(%" PRIx64 ", [%" PRIx64 ", %" PRIx64
+           "])\n",
+           GetDataSourceLabel(data_source_), analyzer, label_from_vmaddr, addr,
+           size);
+  }
+  assert(translator_);
+  for (auto& pair : outputs_) {
+    std::string label;
+    if (pair.first->vm_map.TryGetLabel(label_from_vmaddr, &label)) {
+      bool ok = pair.first->vm_map.AddRangeWithTranslation(
+          addr, size, label, translator_->vm_map, verbose,
+          &pair.first->file_map);
+      if (!ok && verbose_level > 0) {
+        WARN("VM range ($0, $1) for label $2 extends beyond base map", addr,
+             size, label);
       }
     } else if (verbose_level > 2) {
       printf("No label found for vmaddr %" PRIx64 "\n", label_from_vmaddr);
@@ -947,19 +1170,21 @@ void RangeSink::AddVMRangeFor(const char* analyzer, uint64_t label_from_vmaddr,
 
 void RangeSink::AddVMRange(const char* analyzer, uint64_t vmaddr,
                            uint64_t vmsize, const std::string& name) {
-  if (verbose_level > 2) {
-    fprintf(stdout, "[%s, %s] AddVMRange(%.*s, %" PRIx64 ", %" PRIx64 ")\n",
-            GetDataSourceLabel(data_source_), analyzer, (int)name.size(),
-            name.data(), vmaddr, vmsize);
+  bool verbose = IsVerboseForVMRange(vmaddr, vmsize);
+  if (verbose) {
+    printf("[%s, %s] AddVMRange(%.*s, %" PRIx64 ", %" PRIx64 ")\n",
+           GetDataSourceLabel(data_source_), analyzer, (int)name.size(),
+           name.data(), vmaddr, vmsize);
   }
   assert(translator_);
   for (auto& pair : outputs_) {
     const std::string label = pair.second->Munge(name);
     bool ok = pair.first->vm_map.AddRangeWithTranslation(
-        vmaddr, vmsize, label, translator_->vm_map, &pair.first->file_map);
+        vmaddr, vmsize, label, translator_->vm_map, verbose,
+        &pair.first->file_map);
     if (!ok) {
-      THROWF("VM range ($0, $1) for label $2 extends beyond base map", vmaddr,
-             vmsize, name);
+      WARN("VM range ($0, $1) for label $2 extends beyond base map", vmaddr,
+           vmsize, name);
     }
   }
 }
@@ -981,12 +1206,19 @@ void RangeSink::AddVMRangeIgnoreDuplicate(const char* analyzer, uint64_t vmaddr,
 void RangeSink::AddRange(const char* analyzer, string_view name,
                          uint64_t vmaddr, uint64_t vmsize, uint64_t fileoff,
                          uint64_t filesize) {
-  if (verbose_level > 2) {
-    fprintf(stdout,
-            "[%s, %s] AddRange(%.*s, %" PRIx64 ", %" PRIx64 ", %" PRIx64
-            ", %" PRIx64 ")\n",
-            GetDataSourceLabel(data_source_), analyzer, (int)name.size(),
-            name.data(), vmaddr, vmsize, fileoff, filesize);
+  if (vmsize == RangeMap::kUnknownSize || filesize == RangeMap::kUnknownSize) {
+    // AddRange() is used for segments and sections; the mappings that establish
+    // the file <-> vm mapping.  The size should always be known.  Moreover it
+    // would be unclear how the logic should work if the size was *not* known.
+    THROW("AddRange() does not allow unknown size.");
+  }
+
+  if (IsVerboseForVMRange(vmaddr, vmsize) ||
+      IsVerboseForFileRange(fileoff, filesize)) {
+    printf("[%s, %s] AddRange(%.*s, %" PRIx64 ", %" PRIx64 ", %" PRIx64
+           ", %" PRIx64 ")\n",
+           GetDataSourceLabel(data_source_), analyzer, (int)name.size(),
+           name.data(), vmaddr, vmsize, fileoff, filesize);
   }
 
   if (translator_) {
@@ -994,15 +1226,6 @@ void RangeSink::AddRange(const char* analyzer, string_view name,
         !translator_->file_map.CoversRange(fileoff, filesize)) {
       THROW("Tried to add range that is not covered by base map.");
     }
-  }
-
-  if (vmaddr + vmsize < vmaddr) {
-    THROWF("Overflow in vm range, vmaddr=$0, vmsize=$1", vmaddr, vmsize);
-  }
-
-  if (fileoff + filesize < fileoff) {
-    THROWF("Overflow in file range, fileoff=$0, filesize=$1", fileoff,
-           filesize);
   }
 
   for (auto& pair : outputs_) {
@@ -1144,13 +1367,16 @@ class Bloaty {
     }
   }
 
-  void ScanAndRollupFiles(const std::vector<std::unique_ptr<ObjectFile>>& files,
+  void ScanAndRollupFiles(const std::vector<std::string>& filenames,
                           std::vector<std::string>* build_ids,
                           Rollup* rollup) const;
-  void ScanAndRollupFile(ObjectFile* file, Rollup* rollup,
-                         std::string* out_build_id) const;
+  void ScanAndRollupFile(const std::string& filename, Rollup* rollup,
+                         std::vector<std::string>* out_build_ids) const;
+
+  std::unique_ptr<ObjectFile> GetObjectFile(const std::string& filename) const;
 
   const InputFileFactory& file_factory_;
+  const Options options_;
 
   // All data sources, indexed by name.
   // Contains both built-in sources and custom sources.
@@ -1162,53 +1388,59 @@ class Bloaty {
   std::vector<ConfiguredDataSource*> sources_;
   std::vector<std::string> source_names_;
 
-  std::vector<std::unique_ptr<ObjectFile>> input_files_;
-  std::vector<std::unique_ptr<ObjectFile>> base_files_;
-  std::map<std::string, std::unique_ptr<ObjectFile>> debug_files_;
+  struct InputFileInfo {
+    std::string filename_;
+    std::string build_id_;
+  };
+  std::vector<InputFileInfo> input_files_;
+  std::vector<InputFileInfo> base_files_;
+  std::map<std::string, std::string> debug_files_;
 };
 
 Bloaty::Bloaty(const InputFileFactory& factory, const Options& options)
-    : file_factory_(factory) {
+    : file_factory_(factory), options_(options) {
   AddBuiltInSources(data_sources, options);
 }
 
-void Bloaty::AddFilename(const std::string& filename, bool is_base) {
+std::unique_ptr<ObjectFile> Bloaty::GetObjectFile(
+    const std::string& filename) const {
   std::unique_ptr<InputFile> file(file_factory_.OpenFile(filename));
   auto object_file = TryOpenELFFile(file);
 
   if (!object_file.get()) {
     object_file = TryOpenMachOFile(file);
+  }
+
+  if (!object_file.get()) {
+    object_file = TryOpenWebAssemblyFile(file);
   }
 
   if (!object_file.get()) {
     THROWF("unknown file type for file '$0'", filename.c_str());
   }
 
+  return object_file;
+}
+
+void Bloaty::AddFilename(const std::string& filename, bool is_base) {
+  auto object_file = GetObjectFile(filename);
+  std::string build_id = object_file->GetBuildId();
+
   if (is_base) {
-    base_files_.push_back(std::move(object_file));
+    base_files_.push_back({filename, build_id});
   } else {
-    input_files_.push_back(std::move(object_file));
+    input_files_.push_back({filename, build_id});
   }
 }
 
 void Bloaty::AddDebugFilename(const std::string& filename) {
-  std::unique_ptr<InputFile> file(file_factory_.OpenFile(filename));
-  auto object_file = TryOpenELFFile(file);
-
-  if (!object_file.get()) {
-    object_file = TryOpenMachOFile(file);
-  }
-
-  if (!object_file.get()) {
-    THROWF("unknown file type for file '$0'", filename);
-  }
-
+  auto object_file = GetObjectFile(filename);
   std::string build_id = object_file->GetBuildId();
   if (build_id.size() == 0) {
     THROWF("File '$0' has no build ID, cannot be used as a debug file",
            filename);
   }
-  debug_files_[build_id] = std::move(object_file);
+  debug_files_[build_id] = filename;
 }
 
 void Bloaty::DefineCustomDataSource(const CustomDataSource& source) {
@@ -1327,23 +1559,26 @@ struct DualMaps {
   std::vector<std::unique_ptr<DualMap>> maps_;
 };
 
-void Bloaty::ScanAndRollupFile(ObjectFile* file, Rollup* rollup,
-                               std::string* out_build_id) const {
+void Bloaty::ScanAndRollupFile(const std::string &filename, Rollup* rollup,
+                               std::vector<std::string>* out_build_ids) const {
+  auto file = GetObjectFile(filename);
+
   DualMaps maps;
   std::vector<std::unique_ptr<RangeSink>> sinks;
   std::vector<RangeSink*> sink_ptrs;
   std::vector<RangeSink*> filename_sink_ptrs;
 
   // Base map always goes first.
-  sinks.push_back(absl::make_unique<RangeSink>(
-      &file->file_data(), DataSource::kSegments, nullptr));
+  sinks.push_back(absl::make_unique<RangeSink>(&file->file_data(), options_,
+                                               DataSource::kSegments, nullptr));
   NameMunger empty_munger;
   sinks.back()->AddOutput(maps.base_map(), &empty_munger);
   sink_ptrs.push_back(sinks.back().get());
 
   for (auto source : sources_) {
-    sinks.push_back(absl::make_unique<RangeSink>(
-        &file->file_data(), source->effective_source, maps.base_map()));
+    sinks.push_back(absl::make_unique<RangeSink>(&file->file_data(), options_,
+                                                 source->effective_source,
+                                                 maps.base_map()));
     sinks.back()->AddOutput(maps.AppendMap(), source->munger.get());
     // We handle the kInputFiles data source internally, without handing it off
     // to the file format implementation.  This seems slightly simpler, since
@@ -1357,16 +1592,19 @@ void Bloaty::ScanAndRollupFile(ObjectFile* file, Rollup* rollup,
     }
   }
 
+  std::unique_ptr<ObjectFile> debug_file;
   std::string build_id = file->GetBuildId();
   if (!build_id.empty()) {
     auto iter = debug_files_.find(build_id);
     if (iter != debug_files_.end()) {
-      file->set_debug_file(iter->second.get());
-      *out_build_id = build_id;
+      debug_file = GetObjectFile(iter->second);
+      file->set_debug_file(debug_file.get());
+      out_build_ids->push_back(build_id);
     }
   }
 
-  int64_t filesize_before = rollup->file_total();
+  int64_t filesize_before = rollup->file_total() +
+      rollup->filtered_file_total();
   file->ProcessFile(sink_ptrs);
 
   // kInputFile source: Copy the base map to the filename sink(s).
@@ -1409,40 +1647,48 @@ void Bloaty::ScanAndRollupFile(ObjectFile* file, Rollup* rollup,
   maps.ComputeRollup(rollup);
 
   // The ObjectFile implementation must guarantee this.
-  int64_t filesize = rollup->file_total() - filesize_before;
+  int64_t filesize = rollup->file_total() +
+      rollup->filtered_file_total() - filesize_before;
   (void)filesize;
   assert(filesize == file->file_data().data().size());
 
   if (verbose_level > 0) {
-    fprintf(stdout, "FILE MAP:\n");
+    printf("FILE MAP:\n");
     maps.PrintFileMaps();
-    fprintf(stdout, "VM MAP:\n");
+    printf("VM MAP:\n");
     maps.PrintVMMaps();
   }
 }
 
 void Bloaty::ScanAndRollupFiles(
-    const std::vector<std::unique_ptr<ObjectFile>>& files,
+    const std::vector<std::string>& filenames,
     std::vector<std::string>* build_ids,
     Rollup * rollup) const {
   int num_cpus = std::thread::hardware_concurrency();
-  int num_threads = std::min(num_cpus, static_cast<int>(files.size()));
+  int num_threads = std::min(num_cpus, static_cast<int>(filenames.size()));
 
   struct PerThreadData {
     Rollup rollup;
-    std::string build_id;
+    std::vector<std::string> build_ids;
   };
 
   std::vector<PerThreadData> thread_data(num_threads);
   std::vector<std::thread> threads(num_threads);
-  ThreadSafeIterIndex index(files.size());
+  ThreadSafeIterIndex index(filenames.size());
+
+  std::unique_ptr<RE2> regex = nullptr;
+  if (options_.has_source_filter()) {
+    regex = absl::make_unique<RE2>(options_.source_filter());
+  }
 
   for (int i = 0; i < num_threads; i++) {
-    threads[i] = std::thread([this, &index, &files](PerThreadData* data) {
+    thread_data[i].rollup.SetFilterRegex(regex.get());
+
+    threads[i] = std::thread([this, &index, &filenames](PerThreadData* data) {
       try {
         int j;
         while (index.TryGetNext(&j)) {
-          ScanAndRollupFile(files[j].get(), &data->rollup, &data->build_id);
+          ScanAndRollupFile(filenames[j], &data->rollup, &data->build_ids);
         }
       } catch (const bloaty::Error& e) {
         index.Abort(e.what());
@@ -1459,9 +1705,9 @@ void Bloaty::ScanAndRollupFiles(
       rollup->Add(data->rollup);
     }
 
-    if (!data->build_id.empty()) {
-      build_ids->push_back(data->build_id);
-    }
+    build_ids->insert(build_ids->end(),
+                      data->build_ids.begin(),
+                      data->build_ids.end());
   }
 
   std::string error;
@@ -1481,11 +1727,19 @@ void Bloaty::ScanAndRollup(const Options& options, RollupOutput* output) {
 
   Rollup rollup;
   std::vector<std::string> build_ids;
-  ScanAndRollupFiles(input_files_, &build_ids, &rollup);
+  std::vector<std::string> input_filenames;
+  for (const auto& file_info : input_files_) {
+    input_filenames.push_back(file_info.filename_);
+  }
+  ScanAndRollupFiles(input_filenames, &build_ids, &rollup);
 
   if (!base_files_.empty()) {
     Rollup base;
-    ScanAndRollupFiles(base_files_, &build_ids, &base);
+    std::vector<std::string> base_filenames;
+    for (const auto& file_info : base_files_) {
+      base_filenames.push_back(file_info.filename_);
+    }
+    ScanAndRollupFiles(base_filenames, &build_ids, &base);
     rollup.Subtract(base);
     rollup.CreateDiffModeRollupOutput(&base, options, output);
   } else {
@@ -1503,19 +1757,19 @@ void Bloaty::ScanAndRollup(const Options& options, RollupOutput* output) {
     for (const auto& pair : debug_files_) {
       unused_debug += absl::Substitute(
           "$0   $1\n",
-          absl::BytesToHexString(pair.second->GetBuildId()).c_str(),
-          pair.second->file_data().filename().c_str());
+          absl::BytesToHexString(pair.first).c_str(),
+          pair.second.c_str());
     }
 
-    for (const auto& file : input_files_) {
+    for (const auto& file_info : input_files_) {
       input_files += absl::Substitute(
-          "$0   $1\n", absl::BytesToHexString(file->GetBuildId()).c_str(),
-          file->file_data().filename().c_str());
+          "$0   $1\n", absl::BytesToHexString(file_info.build_id_).c_str(),
+          file_info.filename_.c_str());
     }
-    for (const auto& file : base_files_) {
+    for (const auto& file_info : base_files_) {
       input_files += absl::Substitute(
-          "$0   $1\n", absl::BytesToHexString(file->GetBuildId()).c_str(),
-          file->file_data().filename().c_str());
+          "$0   $1\n", absl::BytesToHexString(file_info.build_id_).c_str(),
+          file_info.filename_.c_str());
     }
     THROWF(
         "Debug file(s) did not match any input file:\n$0\nInput Files:\n$1",
@@ -1526,7 +1780,8 @@ void Bloaty::ScanAndRollup(const Options& options, RollupOutput* output) {
 void Bloaty::DisassembleFunction(string_view function, const Options& options,
                                  RollupOutput* output) {
   DisassemblyInfo info;
-  for (auto& file : input_files_) {
+  for (const auto& file_info : input_files_) {
+    auto file = GetObjectFile(file_info.filename_);
     if (file->GetDisassemblyInfo(function, EffectiveSymbolSource(options),
                                  &info)) {
       output->SetDisassembly(::bloaty::DisassembleFunction(info));
@@ -1544,6 +1799,7 @@ USAGE: bloaty [OPTION]... FILE... [-- BASE_FILE...]
 Options:
 
   --csv              Output in CSV format instead of human-readable.
+  --tsv              Output in TSV format instead of human-readable.
   -c FILE            Load configuration from <file>.
   -d SOURCE,SOURCE   Comma-separated list of sources to scan.
   --debug-file=FILE  Use this file for debug symbols and/or symbol table.
@@ -1554,6 +1810,10 @@ Options:
                      The default is --demangle=short.
   --disassemble=FUNCTION
                      Disassemble this function (EXPERIMENTAL)
+  --domain=DOMAIN    Which domains to show.  Possible values are:
+                       --domain=vm
+                       --domain=file
+                       --domain=both (the default)
   -n NUM             How many rows to show per level before collapsing
                      other keys into '[Other]'.  Set to '0' for unlimited.
                      Defaults to 20.
@@ -1562,12 +1822,21 @@ Options:
                        -s vm
                        -s file
                        -s both (the default: sorts by max(vm, file)).
-  -v                 Verbose output.  Dumps warnings encountered during
-                     processing and full VM/file maps at the end.
-                     Add more v's (-vv, -vvv) for even more.
   -w                 Wide output; don't truncate long labels.
   --help             Display this message and exit.
   --list-sources     Show a list of available sources and exit.
+  --source-filter=PATTERN
+                     Only show keys with names matching this pattern.
+
+Options for debugging Bloaty:
+
+  --debug-vmaddr=ADDR
+  --debug-fileoff=OFF
+                     Print extended debugging information for the given
+                     VM address and/or file offset.
+  -v                 Verbose output.  Dumps warnings encountered during
+                     processing and full VM/file maps at the end.
+                     Add more v's (-vv, -vvv) for even more.
 )";
 
 class ArgParser {
@@ -1636,7 +1905,30 @@ class ArgParser {
 
   bool TryParseIntegerOption(string_view flag, int* val) {
     string_view val_str;
-    return TryParseOption(flag, &val_str) && absl::SimpleAtoi(val_str, val);
+    if (!TryParseOption(flag, &val_str)) {
+      return false;
+    }
+
+    if (!absl::SimpleAtoi(val_str, val)) {
+      THROWF("option '$0' had non-integral argument: $1", flag, val_str);
+    }
+
+    return true;
+  }
+
+  bool TryParseUint64Option(string_view flag, uint64_t* val) {
+    string_view val_str;
+    if (!TryParseOption(flag, &val_str)) {
+      return false;
+    }
+
+    try {
+      *val = std::stoull(std::string(val_str), nullptr, 0);
+    } catch (...) {
+      THROWF("option '$0' had non-integral argument: $1", flag, val_str);
+    }
+
+    return true;
   }
 
  public:
@@ -1653,6 +1945,8 @@ bool DoParseOptions(bool skip_unknown, int* argc, char** argv[],
   ArgParser args(argc, argv);
   string_view option;
   int int_option;
+  uint64_t uint64_option;
+  bool has_domain = false;
 
   while (!args.IsDone()) {
     if (args.TryParseFlag("--")) {
@@ -1662,6 +1956,8 @@ bool DoParseOptions(bool skip_unknown, int* argc, char** argv[],
       saw_separator = true;
     } else if (args.TryParseFlag("--csv")) {
       output_options->output_format = OutputFormat::kCSV;
+    } else if (args.TryParseFlag("--tsv")) {
+      output_options->output_format = OutputFormat::kTSV;
     } else if (args.TryParseOption("-c", &option)) {
       std::ifstream input_file(std::string(option), std::ios::in);
       if (!input_file.is_open()) {
@@ -1689,6 +1985,16 @@ bool DoParseOptions(bool skip_unknown, int* argc, char** argv[],
       }
     } else if (args.TryParseOption("--debug-file", &option)) {
       options->add_debug_filename(std::string(option));
+    } else if (args.TryParseUint64Option("--debug-fileoff", &uint64_option)) {
+      if (options->has_debug_fileoff()) {
+        THROW("currently we only support a single debug fileoff");
+      }
+      options->set_debug_fileoff(uint64_option);
+    } else if (args.TryParseUint64Option("--debug-vmaddr", &uint64_option)) {
+      if (options->has_debug_vmaddr()) {
+        THROW("currently we only support a single debug vmaddr");
+      }
+      options->set_debug_vmaddr(uint64_option);
     } else if (args.TryParseOption("--disassemble", &option)) {
       options->mutable_disassemble_function()->assign(std::string(option));
     } else if (args.TryParseIntegerOption("-n", &int_option)) {
@@ -1696,6 +2002,17 @@ bool DoParseOptions(bool skip_unknown, int* argc, char** argv[],
         options->set_max_rows_per_level(INT64_MAX);
       } else {
         options->set_max_rows_per_level(int_option);
+      }
+    } else if (args.TryParseOption("--domain", &option)) {
+      has_domain = true;
+      if (option == "vm") {
+        output_options->show = ShowDomain::kShowVM;
+      } else if (option == "file") {
+        output_options->show = ShowDomain::kShowFile;
+      } else if (option == "both") {
+        output_options->show = ShowDomain::kShowBoth;
+      } else {
+        THROWF("unknown value for --domain: $0", option);
       }
     } else if (args.TryParseOption("-s", &option)) {
       if (option == "vm") {
@@ -1707,6 +2024,8 @@ bool DoParseOptions(bool skip_unknown, int* argc, char** argv[],
       } else {
         THROWF("unknown value for -s: $0", option);
       }
+    } else if (args.TryParseOption("--source-filter", &option)) {
+      options->set_source_filter(std::string(option));
     } else if (args.TryParseFlag("-v")) {
       options->set_verbose_level(1);
     } else if (args.TryParseFlag("-vv")) {
@@ -1722,8 +2041,11 @@ bool DoParseOptions(bool skip_unknown, int* argc, char** argv[],
       }
       return false;
     } else if (args.TryParseFlag("--help")) {
-      fputs(usage, stderr);
+      puts(usage);
       return false;
+    } else if (args.TryParseFlag("--version")) {
+      printf("Bloaty McBloatface 1.0\n");
+      exit(0);
     } else if (absl::StartsWith(args.Arg(), "-")) {
       if (skip_unknown) {
         args.ConsumeAndSaveArg();
@@ -1743,6 +2065,21 @@ bool DoParseOptions(bool skip_unknown, int* argc, char** argv[],
       !options->has_disassemble_function()) {
     // Default when no sources are specified.
     options->add_data_source("sections");
+  }
+
+  if (has_domain && !options->has_sort_by()) {
+    // Default to sorting by what we are showing.
+    switch (output_options->show) {
+      case ShowDomain::kShowFile:
+        options->set_sort_by(Options::SORTBY_FILESIZE);
+        break;
+      case ShowDomain::kShowVM:
+        options->set_sort_by(Options::SORTBY_VMSIZE);
+        break;
+      case ShowDomain::kShowBoth:
+        options->set_sort_by(Options::SORTBY_BOTH);
+        break;
+    }
   }
 
   return true;
@@ -1788,6 +2125,13 @@ void BloatyDoMain(const Options& options, const InputFileFactory& file_factory,
 
   for (const auto& data_source : options.data_source()) {
     bloaty.AddDataSource(data_source);
+  }
+
+  if (options.has_source_filter()) {
+    RE2 re(options.source_filter());
+    if (!re.ok()) {
+      THROW("invalid regex for source_filter");
+    }
   }
 
   verbose_level = options.verbose_level();

@@ -21,7 +21,9 @@
 
 #include <stdlib.h>
 #define __STDC_LIMIT_MACROS
+#define __STDC_FORMAT_MACROS
 #include <stdint.h>
+#include <inttypes.h>
 
 #include <memory>
 #include <set>
@@ -31,8 +33,10 @@
 
 #include "absl/strings/string_view.h"
 #include "absl/strings/strip.h"
-#include "capstone.h"
+#include "capstone/capstone.h"
 #include "re2/re2.h"
+
+#include "bloaty.pb.h"
 #include "range_map.h"
 
 #define BLOATY_DISALLOW_COPY_AND_ASSIGN(class_name) \
@@ -134,14 +138,17 @@ class MmapInputFileFactory : public InputFileFactory {
 // space and/or file offsets.
 class RangeSink {
  public:
-  RangeSink(const InputFile* file, DataSource data_source,
-            const DualMap* translator);
+  RangeSink(const InputFile* file, const Options& options,
+            DataSource data_source, const DualMap* translator);
   ~RangeSink();
+
+  const Options& options() const { return options_; }
 
   void AddOutput(DualMap* map, const NameMunger* munger);
 
   DataSource data_source() const { return data_source_; }
   const InputFile& input_file() const { return *file_; }
+  bool IsBaseMap() const { return translator_ == nullptr; }
 
   // If vmsize or filesize is zero, this mapping is presumed not to exist in
   // that domain.  For example, .bss mappings don't exist in the file, and
@@ -161,10 +168,16 @@ class RangeSink {
   // Like AddFileRange(), but the label is whatever label was previously
   // assigned to VM address |label_from_vmaddr|.  If no existing label is
   // assigned to |label_from_vmaddr|, this function does nothing.
-  void AddFileRangeFor(const char* analyzer, uint64_t label_from_vmaddr,
-                       absl::string_view file_range);
-  void AddVMRangeFor(const char* analyzer, uint64_t label_from_vmaddr,
-                     uint64_t addr, uint64_t size);
+  void AddFileRangeForVMAddr(const char* analyzer, uint64_t label_from_vmaddr,
+                             absl::string_view file_range);
+  void AddVMRangeForVMAddr(const char* analyzer, uint64_t label_from_vmaddr,
+                           uint64_t addr, uint64_t size);
+
+  // Applies this label from |from_file_range| to |file_range|, but only if the
+  // entire |from_file_range| has a single label.  If not, this does nothing.
+  void AddFileRangeForFileRange(const char* analyzer,
+                                absl::string_view from_file_range,
+                                absl::string_view file_range);
 
   void AddFileRange(const char* analyzer, absl::string_view name,
                     absl::string_view file_range) {
@@ -215,7 +228,7 @@ class RangeSink {
   uint64_t TranslateFileToVM(const char* ptr);
   absl::string_view TranslateVMToFile(uint64_t address);
 
-  static const uint64_t kUnknownSize = RangeMap::kUnknownSize;
+  static constexpr uint64_t kUnknownSize = RangeMap::kUnknownSize;
 
  private:
   BLOATY_DISALLOW_COPY_AND_ASSIGN(RangeSink);
@@ -225,7 +238,13 @@ class RangeSink {
     return ptr >= file_data.data() && ptr < file_data.data() + file_data.size();
   }
 
+  bool ContainsVerboseVMAddr(uint64_t vmaddr, uint64_t vmsize);
+  bool ContainsVerboseFileOffset(uint64_t fileoff, uint64_t filesize);
+  bool IsVerboseForVMRange(uint64_t vmaddr, uint64_t vmsize);
+  bool IsVerboseForFileRange(uint64_t fileoff, uint64_t filesize);
+
   const InputFile* file_;
+  const Options options_;
   DataSource data_source_;
   const DualMap* translator_;
   std::vector<std::pair<DualMap*, const NameMunger*>> outputs_;
@@ -291,6 +310,7 @@ class ObjectFile {
 
 std::unique_ptr<ObjectFile> TryOpenELFFile(std::unique_ptr<InputFile>& file);
 std::unique_ptr<ObjectFile> TryOpenMachOFile(std::unique_ptr<InputFile>& file);
+std::unique_ptr<ObjectFile> TryOpenWebAssemblyFile(std::unique_ptr<InputFile>& file);
 
 namespace dwarf {
 
@@ -412,6 +432,8 @@ struct RollupRow {
   std::string name;
   int64_t vmsize = 0;
   int64_t filesize = 0;
+  int64_t filtered_vmsize = 0;
+  int64_t filtered_filesize = 0;
   int64_t other_count = 0;
   int64_t sortkey;
   double vmpercent;
@@ -431,11 +453,19 @@ struct RollupRow {
 enum class OutputFormat {
   kPrettyPrint,
   kCSV,
+  kTSV,
+};
+
+enum class ShowDomain {
+  kShowFile,
+  kShowVM,
+  kShowBoth,
 };
 
 struct OutputOptions {
   OutputFormat output_format = OutputFormat::kPrettyPrint;
   size_t max_label_len = 80;
+  ShowDomain show = ShowDomain::kShowBoth;
 };
 
 struct RollupOutput {
@@ -452,10 +482,13 @@ struct RollupOutput {
     if (!source_names_.empty()) {
       switch (options.output_format) {
         case bloaty::OutputFormat::kPrettyPrint:
-          PrettyPrint(options.max_label_len, out);
+          PrettyPrint(options, out);
           break;
         case bloaty::OutputFormat::kCSV:
-          PrintToCSV(out);
+          PrintToCSV(out, /*tabs=*/false);
+          break;
+        case bloaty::OutputFormat::kTSV:
+          PrintToCSV(out, /*tabs=*/true);
           break;
         default:
           BLOATY_UNREACHABLE();
@@ -488,19 +521,19 @@ struct RollupOutput {
   // When we are in diff mode, rollup sizes are relative to the baseline.
   bool diff_mode_ = false;
 
-  void PrettyPrint(size_t max_label_len, std::ostream* out) const;
-  void PrintToCSV(std::ostream* out) const;
-  size_t CalculateLongestLabel(const RollupRow& row, int indent) const;
-  void PrettyPrintRow(const RollupRow& row, size_t indent, size_t longest_row,
-                      std::ostream* out) const;
-  void PrettyPrintTree(const RollupRow& row, size_t indent, size_t longest_row,
-                       std::ostream* out) const;
+  static bool IsSame(const std::string& a, const std::string& b);
+  void PrettyPrint(const OutputOptions& options, std::ostream* out) const;
+  void PrintToCSV(std::ostream* out, bool tabs) const;
+  void PrettyPrintRow(const RollupRow& row, size_t indent,
+                      const OutputOptions& options, std::ostream* out) const;
+  void PrettyPrintTree(const RollupRow& row, size_t indent,
+                       const OutputOptions& options, std::ostream* out) const;
   void PrintRowToCSV(const RollupRow& row,
                      std::vector<std::string> parent_labels,
-                     std::ostream* out) const;
+                     std::ostream* out, bool tabs) const;
   void PrintTreeToCSV(const RollupRow& row,
                       std::vector<std::string> parent_labels,
-                      std::ostream* out) const;
+                      std::ostream* out, bool tabs) const;
 };
 
 bool ParseOptions(bool skip_unknown, int* argc, char** argv[], Options* options,

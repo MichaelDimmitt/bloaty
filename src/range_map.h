@@ -71,7 +71,8 @@ class RangeMap {
   // case).
   bool AddRangeWithTranslation(uint64_t addr, uint64_t size,
                                const std::string& val,
-                               const RangeMap& translator, RangeMap* other);
+                               const RangeMap& translator, bool verbose,
+                               RangeMap* other);
 
   // Returns whether this RangeMap fully covers the given range.
   bool CoversRange(uint64_t addr, uint64_t size) const;
@@ -83,7 +84,9 @@ class RangeMap {
   // Looks for a range within this map that contains |addr|.  If found, returns
   // true and sets |label| to the corresponding label, and |offset| to the
   // offset from the beginning of this range.
-  bool TryGetLabel(uint64_t addr, std::string* label, uint64_t* offset) const;
+  bool TryGetLabel(uint64_t addr, std::string* label) const;
+  bool TryGetLabelForRange(uint64_t addr, uint64_t size,
+                           std::string* label) const;
 
   // Looks for a range that starts exactly on |addr|.  If it exists, returns
   // true and sets |size| to its size.
@@ -135,7 +138,7 @@ class RangeMap {
     }
   }
 
-  static const uint64_t kUnknownSize = UINT64_MAX;
+  static constexpr uint64_t kUnknownSize = UINT64_MAX;
 
  private:
   friend class RangeMapTest;
@@ -211,8 +214,9 @@ class RangeMap {
 
   template <class T>
   bool TranslateAndTrimRangeWithEntry(T iter, uint64_t addr, uint64_t size,
-                                      uint64_t* out_addr,
-                                      uint64_t* out_size) const;
+                                      uint64_t* trimmed_addr,
+                                      uint64_t* translated_addr,
+                                      uint64_t* trimmed_size) const;
 
   // Finds the entry that contains |addr|.  If no such mapping exists, returns
   // mappings_.end().
